@@ -4,7 +4,7 @@
      userDefineEntries = entries;
      userProcessEnvDefineEntries = envEntries;
  }
-+/** The captured `__FOO__` define entries as [key, expression] pairs (see setUserDefineEntries). */
++/** The captured `__FOO__` define entries as `[key, expression]` pairs (see setUserDefineEntries). */
 +export function getUserDefineEntries() {
 +    return userDefineEntries;
 +}
@@ -22,20 +22,10 @@
  import { getProjectFlavor } from '../../helpers/flavor.js';
  import { getMonorepoWorkspaceRoot } from '../../helpers/project.js';
  import { createNativeClassEsbuildPlugin } from '../../helpers/nativeclass-esbuild-plugin.js';
-@@ -85,6 +85,8 @@
- // Entry resolution — recorded `/ns/m/node_modules/...` paths → physical files
- // ============================================================================
- const SCRIPT_EXT_RE = /\.(ts|tsx|js|jsx|mjs|mts|cts)$/i;
-+// esbuild `define` accepts only literals and identifier/member chains.
-+const ESBUILD_DEFINE_VALUE_RE = /^(?:true|false|null|undefined|-?\d+(?:\.\d+)?|"(?:[^"\\]|\\.)*"|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)$/;
- const NON_BUNDLEABLE_EXT_RE = /\.(css|scss|sass|less|json|html|vue|svelte)$/i;
- /** Registry key for a physical file: substring from the LAST node_modules segment. */
- export function depsRegistryKeyForFile(absPath) {
-@@ -112,6 +114,40 @@
+@@ -112,6 +112,38 @@
      const exts = platformResolveExtensions(platform);
      return [...(hasExt ? [spec] : []), ...exts.map((ext) => baseNoExt + ext), ...exts.map((ext) => baseNoExt + '/index' + ext)];
  }
-+/** Flatten a package.json `exports` target (string or conditions object) into file candidates, ESM conditions first. */
 +function collectExportsMapTargets(node, out) {
 +    if (!node)
 +        return;
@@ -46,13 +36,14 @@
 +    if (typeof node === 'object' && !Array.isArray(node)) {
 +        // Prefer client/ESM conditions in the order esbuild would.
 +        for (const cond of ['module', 'import', 'browser', 'default', 'require']) {
-+            if (node[cond] !== undefined)
-+                collectExportsMapTargets(node[cond], out);
++            const next = node[cond];
++            if (next !== undefined)
++                collectExportsMapTargets(next, out);
 +        }
 +    }
 +}
-+/** First candidate that exists inside pkgDir, with the platform-suffix and `/index` fan-out. */
 +function resolvePackageFileCandidates(pkgDir, candidates, platform) {
++    const exts = platformResolveExtensions(platform);
 +    for (const cand of candidates) {
 +        const abs = path.resolve(pkgDir, cand);
 +        if (!abs.startsWith(pkgDir + path.sep))
@@ -60,11 +51,9 @@
 +        if (existsSync(abs) && statSync(abs).isFile())
 +            return abs;
 +        const base = abs.replace(SCRIPT_EXT_RE, '');
-+        for (const ext of platformResolveExtensions(platform)) {
-+            for (const candidate of [base + ext, base + '/index' + ext]) {
-+                if (existsSync(candidate) && statSync(candidate).isFile())
-+                    return candidate;
-+            }
++        for (const candidate of [...exts.map((ext) => base + ext), ...exts.map((ext) => base + '/index' + ext)]) {
++            if (existsSync(candidate) && statSync(candidate).isFile())
++                return candidate;
 +        }
 +    }
 +    return null;
@@ -72,7 +61,7 @@
  /**
   * Resolve a package ROOT spec (`/node_modules/<pkg>`) to its entry file via
   * the package's own `exports['.']`/`module`/`main`, honoring platform
-@@ -138,39 +174,15 @@
+@@ -138,41 +170,47 @@
              continue;
          }
          const candidates = [];
@@ -108,41 +97,83 @@
 -            for (const ext of platformResolveExtensions(platform)) {
 -                if (existsSync(base + ext))
 -                    return base + ext;
--            }
--        }
 +        const resolved = resolvePackageFileCandidates(pkgDir, candidates, platform);
 +        if (resolved)
 +            return resolved;
++    }
++    return null;
++}
++function resolvePackageSubpathEntry(pkgDir, subpath, platform) {
++    const candidates = [];
++    try {
++        const pkg = JSON.parse(readFileSync(path.join(pkgDir, 'package.json'), 'utf-8'));
++        const exportsMap = pkg.exports && typeof pkg.exports === 'object' && !Array.isArray(pkg.exports) ? pkg.exports : null;
++        if (exportsMap) {
++            const key = `./${subpath}`;
++            collectExportsMapTargets(exportsMap[key], candidates);
++            for (const [pattern, target] of Object.entries(exportsMap)) {
++                const star = pattern.indexOf('*');
++                if (star === -1)
++                    continue;
++                const prefix = pattern.slice(0, star);
++                const suffix = pattern.slice(star + 1);
++                if (key.length < prefix.length + suffix.length || !key.startsWith(prefix) || !key.endsWith(suffix))
++                    continue;
++                const captured = key.slice(prefix.length, key.length - suffix.length);
++                const targets = [];
++                collectExportsMapTargets(target, targets);
++                for (const t of targets)
++                    candidates.push(t.split('*').join(captured));
+             }
+         }
      }
-     return null;
+-    return null;
++    catch {
++        // Unreadable manifest: fall through to the on-disk lookup.
++    }
++    candidates.push(subpath);
++    return resolvePackageFileCandidates(pkgDir, candidates, platform);
  }
-@@ -582,6 +594,14 @@
+ /** `/node_modules/<pkg>` or `/node_modules/@scope/<pkg>` with no subpath. */
+ function isPackageRootSpec(spec) {
+@@ -541,7 +579,20 @@
+         if (verbose) {
+             console.warn(`[ns-deps-bundle] disk cache write failed (non-fatal): ${error?.message || error}`);
+         }
++    }
++}
++// esbuild `define` takes JSON literals or identifier/member chains only.
++const DEFINE_IDENTIFIER_CHAIN_RE = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
++function isEsbuildDefineValue(expr) {
++    if (DEFINE_IDENTIFIER_CHAIN_RE.test(expr))
++        return true;
++    try {
++        JSON.parse(expr);
++        return true;
+     }
++    catch {
++        return false;
++    }
+ }
+ export async function generateDepsBundle(options) {
+     const { projectRoot, platform, mode, flavor, verbose } = options;
+@@ -582,6 +633,11 @@
          // substitutes free references, so CJS-wrapped code (where `module` is a
          // bound variable) is untouched.
          out['module.hot'] = 'undefined';
-+        // The app's `__FOO__` defines (e.g. the Vue feature flags
-+        // @vitejs/plugin-vue sets) must reach bundled dep code exactly as they
-+        // reach bundle.mjs, or the deps realm falls back to its own defaults.
++        // App `__FOO__` defines reach dep code here exactly as in bundle.mjs.
 +        for (const [key, expr] of getUserDefineEntries()) {
-+            if (out[key] === undefined && ESBUILD_DEFINE_VALUE_RE.test(expr)) {
++            if (out[key] === undefined && isEsbuildDefineValue(expr))
 +                out[key] = expr;
-+            }
 +        }
          return out;
      })();
      const diskCacheDisabled = isDepsBundleDiskCacheDisabled();
-@@ -719,6 +739,40 @@
+@@ -719,6 +775,24 @@
      }
      return null;
  }
-+/**
-+ * `export * from '<pkg>[/subpath]'` target, resolved the way Node would from
-+ * the re-exporting file: nearest-ancestor `node_modules` walk, then the
-+ * package's declared entry (root) or its `exports` subpath / on-disk file.
-+ * A bundled file with no static export list gets no shim and evaluates a
-+ * second time per-module, so wholesale re-exports of a dependency
-+ * (nativescript-vue → @vue/runtime-core) have to be followed as well.
-+ */
++// Node-style resolution from the importer: nearest node_modules ancestor wins.
 +function resolveBareReExportTarget(spec, importerPath, platform) {
 +    const match = /^((?:@[^/]+\/)?[^/]+)(?:\/(.+))?$/.exec(spec);
 +    if (!match)
@@ -152,16 +183,7 @@
 +    for (;;) {
 +        const pkgDir = path.join(dir, 'node_modules', pkgName);
 +        if (existsSync(path.join(pkgDir, 'package.json'))) {
-+            if (!subpath)
-+                return resolvePackageRootEntry(`/node_modules/${pkgName}`, [dir], platform);
-+            const candidates = [];
-+            try {
-+                const pkg = JSON.parse(readFileSync(path.join(pkgDir, 'package.json'), 'utf-8'));
-+                collectExportsMapTargets(pkg.exports?.[`./${subpath}`], candidates);
-+            }
-+            catch { }
-+            candidates.push(subpath);
-+            return resolvePackageFileCandidates(pkgDir, candidates, platform);
++            return subpath ? resolvePackageSubpathEntry(pkgDir, subpath, platform) : resolvePackageRootEntry(`/node_modules/${pkgName}`, [dir], platform);
 +        }
 +        const parent = path.dirname(dir);
 +        if (parent === dir)
@@ -172,7 +194,36 @@
  // Static CJS export-name discovery: `exports.NAME = ...` and
  // `Object.defineProperty(exports, "NAME", ...)` assignments (transpiled-to-CJS
  // packages like downsample). UMD factories (`module.exports = fn()`) expose no
-@@ -781,9 +835,7 @@
+@@ -742,16 +816,18 @@
+ }
+ /**
+  * Static export-name discovery for a node_modules file. ESM: direct exports
+- * plus recursion through RELATIVE `export * from` chains (the shape deep
+- * package barrels like rxjs's index take). CJS: `exports.NAME` assignment
+- * scanning (esbuild's interop exposes those names on the bundled namespace at
+- * runtime). Returns `names: null` for files whose export surface is not
+- * statically enumerable — with two DIFFERENT consequences downstream:
+- * CJS/UMD files additionally carry `opaqueCjs: true` and still get a
+- * default-only shim (their bundled namespace has nothing but `default`);
+- * ESM files with a bare `export * from 'pkg'` or an unresolvable relative
+- * `export *` target keep per-module serving, where the transform pipeline
+- * resolves the star through the import map.
++ * plus recursion through `export * from` chains — relative targets (the
++ * shape deep package barrels like rxjs's index take) and bare package targets
++ * resolved from the importer like Node would (nativescript-vue re-exporting
++ * `@vue/runtime-core`). CJS: `exports.NAME` assignment scanning (esbuild's
++ * interop exposes those names on the bundled namespace at runtime). Returns
++ * `names: null` for files whose export surface is not statically enumerable —
++ * with two DIFFERENT consequences downstream: CJS/UMD files additionally carry
++ * `opaqueCjs: true` and still get a default-only shim (their bundled
++ * namespace has nothing but `default`); ESM files with an `export *` target
++ * that resolves nowhere on disk keep per-module serving, where the transform
++ * pipeline resolves the star through the import map. A BUNDLED file served
++ * per-module evaluates a second time, so any resolvable star must be followed.
+  */
+ export function collectDepsModuleExportInfo(absPath, platform, seen = new Set()) {
+     if (seen.has(absPath))
+@@ -781,9 +857,7 @@
      const starRe = /^[ \t]*export\s+\*\s+from\s+["']([^"']+)["']/gm;
      while ((match = starRe.exec(code)) !== null) {
          const spec = match[1];
